@@ -1,0 +1,40 @@
+# 忽略训练数据文件夹
+train_set/
+train_set/**
+*/train_set/
+*/train_set/**
+
+# 忽略数据文件
+*.csv
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.whl
+*.zip
+
+# 忽略缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.cache/
+
+# 忽略日志和输出
+logs/
+*.log
+output/
+results/
+
+# 忽略环境文件
+venv/
+env/
+.env
+.venv
+.python-version
+
+# 忽略系统文件
+.DS_Store
+Thumbs.db
