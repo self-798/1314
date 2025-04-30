@@ -19,22 +19,22 @@ from tqdm import tqdm
 import time
 os.environ['TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL'] = '1'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-train_model = True# 是否训练模型
-train_model_hierarchical = True # 是否训练分层模型
-epochs = 20
-target_label = 'label_10'
-seq_length = 20 
-patience = 5 # 早停耐心值
+train_model = False # 是否训练模型
+train_model_hierarchical =  False  # 是否训练分层模型
+epochs = 25
+target_label = 'label_20'
+seq_length = 20
+patience = 7 # 早停耐心值
 class_weights = torch.tensor([2.5, 0.6, 2.6], device=device)
-batch_size = 1024 * 1 # 增大批量大小以提高GPU利用率
-base_lr = 0.0007
+batch_size = 1024 * 2 # 增大批量大小以提高GPU利用率
+base_lr = 0.001
 dropout = 0.2
 
 base_path = r'./train_set/train_set'
 files = [
     f"snapshot_sym{j}_date{i}_{session}.csv"
     for j in range(0, 5)  # sym_0 到 sym_4
-    for i in range(0,100)  # date_0 到 date_100
+    for i in range(0,51)  # date_0 到 date_100
     for session in ['am', 'pm']
 ]
 
@@ -836,96 +836,6 @@ def main():
     plt.show()
     # 在main函数中现有评估标准模型和分层模型的代码后添加：
 
-# 评估集成模型
-    print("\nEvaluating Ensemble Model...")
-    ensemble_eval_start = time.time()
-    standard_model.eval()
-    hierarchical_model.stability_model.eval()
-    hierarchical_model.direction_model.eval()
-
-    ensemble_all_preds = []
-    ensemble_all_labels = []
-
-    with torch.no_grad():
-        for batch_X, batch_y in tqdm(test_loader, desc="Evaluating ensemble model"):
-            # 获取集成预测
-            predictions = ensemble_predict(batch_X, standard_model, hierarchical_model)
-            ensemble_all_preds.extend(predictions.cpu().numpy())
-            ensemble_all_labels.extend(batch_y.cpu().numpy())
-
-    # 计算评估指标
-    ensemble_accuracy = accuracy_score(ensemble_all_labels, ensemble_all_preds)
-    ensemble_report = classification_report(ensemble_all_labels, ensemble_all_preds, digits=4)
-    ensemble_conf_matrix = confusion_matrix(ensemble_all_labels, ensemble_all_preds)
-
-    ensemble_eval_time = time.time() - ensemble_eval_start
-    print(f"Ensemble model evaluation completed, time: {ensemble_eval_time:.2f} seconds")
-
-    print("\nEnsemble Model Evaluation:")
-    print(f"Test Accuracy: {ensemble_accuracy:.4f}")
-    print("\nClassification Report:")
-    print(ensemble_report)
-
-    # 绘制集成模型混淆矩阵
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(ensemble_conf_matrix, annot=True, fmt='d', cmap='Blues')
-    plt.title(f'Ensemble Model Confusion Matrix - {target_label}')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.savefig(f'ensemble_confusion_matrix_{target_label}.png')
-    plt.show()
-
-    # 计算集成模型对比标准和分层模型的提升
-    print("\nFinal Model Performance Comparison:")
-    print(f"Standard Transformer Accuracy: {std_accuracy:.4f}")
-    print(f"Hierarchical Transformer Accuracy: {hier_accuracy:.4f}")
-    print(f"Ensemble Model Accuracy: {ensemble_accuracy:.4f}")
-
-    # 计算相对标准模型的提升
-    std_improvement = (ensemble_accuracy - std_accuracy) / std_accuracy * 100
-    print(f"Ensemble vs Standard: {std_improvement:.2f}%")
-
-    # 计算相对分层模型的提升
-    hier_improvement = (ensemble_accuracy - hier_accuracy) / hier_accuracy * 100
-    print(f"Ensemble vs Hierarchical: {hier_improvement:.2f}%")
-
-    # 各类别F1值对比
-    std_report_dict = classification_report(std_all_labels, std_all_preds, output_dict=True, digits=4)
-    hier_report_dict = classification_report(hier_all_labels, hier_all_preds, output_dict=True, digits=4)
-    ensemble_report_dict = classification_report(ensemble_all_labels, ensemble_all_preds, output_dict=True, digits=4)
-
-    class_names = {0: "Down", 1: "Stable", 2: "Up"}
-    comp_df = pd.DataFrame({
-        'Class': [class_names[i] for i in range(3)],
-        'Standard Model F1': [std_report_dict[str(i)]['f1-score'] for i in range(3)],
-        'Hierarchical Model F1': [hier_report_dict[str(i)]['f1-score'] for i in range(3)],
-        'Ensemble Model F1': [ensemble_report_dict[str(i)]['f1-score'] for i in range(3)]
-    })
-
-    # 计算提升百分比
-    comp_df['Std vs Ensemble (%)'] = (comp_df['Ensemble Model F1'] - comp_df['Standard Model F1']) * 100
-    comp_df['Hier vs Ensemble (%)'] = (comp_df['Ensemble Model F1'] - comp_df['Hierarchical Model F1']) * 100
-
-    print("\nClass-wise F1 Score Comparison:")
-    print(comp_df)
-
-    # 绘制类别F1分数对比图
-    plt.figure(figsize=(12, 6))
-    bar_width = 0.25
-    index = np.arange(3)
-
-    plt.bar(index, comp_df['Standard Model F1'], bar_width, label='标准模型')
-    plt.bar(index + bar_width, comp_df['Hierarchical Model F1'], bar_width, label='分层模型')
-    plt.bar(index + 2*bar_width, comp_df['Ensemble Model F1'], bar_width, label='集成模型')
-
-    plt.xlabel('类别')
-    plt.ylabel('F1分数')
-    plt.title('各模型在不同类别上的F1分数对比')
-    plt.xticks(index + bar_width, ['下跌', '稳定', '上涨'])
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f'model_comparison_{target_label}.png')
-    plt.show()
     # Print GPU memory usage
     if torch.cuda.is_available():
         print("\nGPU Memory Usage:")

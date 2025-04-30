@@ -30,7 +30,7 @@ base_path = r'./train_set/train_set'
 files = [
     f"snapshot_sym{j}_date{i}_{session}.csv"
     for j in range(0, 5)  # sym_1 到 sym_5
-    for i in range(0,101)  # date_0 到 date_7
+    for i in range(0,102)  # date_0 到 date_7
     for session in ['am', 'pm']
 ]
 
@@ -60,8 +60,14 @@ print("\n数据基本信息：")
 print(df.info())
 print("\n数据统计描述：")
 print(df.describe())
+# 保存数据统计描述信息到文件
+print("保存数据统计描述信息...")
+with open('data_description.txt', 'w') as f:
+    f.write("数据统计描述:\n")
+    f.write("==========\n\n")
+    f.write(df.describe().to_string())
 
-import pandas as pd
+print("数据统计描述已保存到 'data_description.txt'")
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
