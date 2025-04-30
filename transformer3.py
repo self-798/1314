@@ -19,22 +19,28 @@ from tqdm import tqdm
 import time
 os.environ['TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL'] = '1'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-train_model = True # 是否训练模型
-train_model_hierarchical =  True # 是否训练分层模型
-epochs = 25
-target_label = 'label_10'
+target_labels = ['label_5', 'label_10', 'label_20', 'label_40', 'label_60']
 seq_length = 60
-patience = 7 # 早停耐心值
+
+train_model = False # 是否训练模型
+train_model_hierarchical =  False # 是否训练分层模型
+show_pic = False # 是否显示图片
+
+
+epochs = 20
+# target_labels = target_labels[0]  # 选择目标标签
+target_label =[ target_labels[0]]
+patience = 5 # 早停耐心值
 class_weights = torch.tensor([2.5, 0.6, 2.6], device=device)
 batch_size = 1024 * 1 # 增大批量大小以提高GPU利用率
-base_lr = 0.001
+base_lr = 0.0013
 dropout = 0.2
 
 base_path = r'./train_set/train_set'
 files = [
     f"snapshot_sym{j}_date{i}_{session}.csv"
     for j in range(0, 5)  # sym_0 到 sym_4
-    for i in range(0,101)  # date_0 到 date_100
+    for i in range(0,102)  # date_0 到 date_100
     for session in ['am', 'pm']
 ]
 
@@ -746,27 +752,31 @@ def main():
         
         standard_train_time = time.time() - train_start
         print(f"标准模型训练完成，总耗时: {standard_train_time:.2f}秒")
+        pict_dir = './figures'
+        if not os.path.exists(pict_dir):
+            os.makedirs(pict_dir)
+        if show_pic:
         # Plot training history
-        plt.figure(figsize=(12, 5))
-        plt.subplot(1, 2, 1)
-        plt.plot(train_losses, label='Training Loss')
-        plt.plot(val_losses, label='Validation Loss')
-        plt.title('Loss Curves')
-        plt.xlabel('Epochs')
-        plt.ylabel('Loss')
-        plt.legend()
+            plt.figure(figsize=(12, 5))
+            plt.subplot(1, 2, 1)
+            plt.plot(train_losses, label='Training Loss')
+            plt.plot(val_losses, label='Validation Loss')
+            plt.title('Loss Curves')
+            plt.xlabel('Epochs')
+            plt.ylabel('Loss')
+            plt.legend()
 
-        plt.subplot(1, 2, 2)
-        plt.plot(train_accs, label='Training Accuracy')
-        plt.plot(val_accs, label='Validation Accuracy')
-        plt.title('Accuracy Curves')
-        plt.xlabel('Epochs')
-        plt.ylabel('Accuracy (%)')
-        plt.legend()
+            plt.subplot(1, 2, 2)
+            plt.plot(train_accs, label='Training Accuracy')
+            plt.plot(val_accs, label='Validation Accuracy')
+            plt.title('Accuracy Curves')
+            plt.xlabel('Epochs')
+            plt.ylabel('Accuracy (%)')
+            plt.legend()
 
-        plt.tight_layout()
-        plt.savefig(f'training_history_{target_label}.png')
-        plt.show()
+            plt.tight_layout()
+            plt.savefig(f'{pict_dir}/training_history_{target_label}.png')
+            # plt.show()
 
     # 训练分层模型
     if train_model_hierarchical:
@@ -807,15 +817,15 @@ def main():
     print(f"Test Accuracy: {std_accuracy:.4f}")
     print("\nClassification Report:")
     print(std_report)
-    
-    # Plot standard model confusion matrix
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(std_conf_matrix, annot=True, fmt='d', cmap='Blues')
-    plt.title(f'Standard Transformer Model Confusion Matrix - {target_label}')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.savefig(f'confusion_matrix_standard_{target_label}.png')
-    plt.show()
+    if show_pic:
+        # Plot standard model confusion matrix
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(std_conf_matrix, annot=True, fmt='d', cmap='Blues')
+        plt.title(f'Standard Transformer Model Confusion Matrix - {target_label}')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.savefig(f'{pict_dir}/training_history_{target_label}.png')
+        # plt.show()
     """
 
     要使用的模型
@@ -834,15 +844,15 @@ def main():
     print(f"Test Accuracy: {hier_accuracy:.4f}")
     print("\nClassification Report:")
     print(hier_report)
-    
+    if show_pic:
     # Plot hierarchical model confusion matrix
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(hier_conf_matrix, annot=True, fmt='d', cmap='Blues')
-    plt.title(f'Hierarchical Transformer Model Confusion Matrix - {target_label}')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.savefig(f'confusion_matrix_hierarchical_{target_label}.png')
-    plt.show()
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(hier_conf_matrix, annot=True, fmt='d', cmap='Blues')
+        plt.title(f'Hierarchical Transformer Model Confusion Matrix - {target_label}')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.savefig(f'{pict_dir}/training_history_{target_label}.png')
+        # plt.show()
     
     # Compare model performance
     print("\nModel Performance Comparison:")
@@ -871,22 +881,54 @@ def main():
     class_df = pd.DataFrame(class_comparison)
     print("\nClass Performance Comparison:")
     print(class_df)
-    
+    # Create a DataFrame with results from standard and hierarchical models
+    calls_df = pd.DataFrame({
+        'True_Label': std_all_labels,
+        'Standard_Pred': std_all_preds,
+        'Hierarchical_Pred': hier_all_preds
+    })
+
+    # Save results to txt files
+    results_dir = f'./results'
+    results_dir_pred = f'./results/predictions'
+    os.makedirs(results_dir_pred, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+
+    # Save the calls dataframe
+    calls_df.to_csv(f'{results_dir_pred}/prediction_results_{target_label}.txt', sep='\t', index=False)
+
+    # Save standard model results
+    with open(f'{results_dir}/standard_model_results_{target_label}.txt', 'w') as f:
+        f.write(f"Accuracy: {std_accuracy:.4f}\n\n")
+        f.write("Classification Report:\n")
+        f.write(str(std_report))
+        f.write("\n\nConfusion Matrix:\n")
+        f.write(str(std_conf_matrix))
+
+    # Save hierarchical model results
+    with open(f'{results_dir}/hierarchical_model_results.txt_{target_label}', 'w') as f:
+        f.write(f"Accuracy: {hier_accuracy:.4f}\n\n")
+        f.write("Classification Report:\n")
+        f.write(str(hier_report))
+        f.write("\n\nConfusion Matrix:\n")
+        f.write(str(hier_conf_matrix))
+
+    print(f"\nResults saved to {results_dir}")
     # Plot class performance comparison
     plt.figure(figsize=(10, 6))
     x = np.arange(len(class_names))
     width = 0.35
-    
-    plt.bar(x - width/2, class_df['Standard Model F1'], width, label='Standard Model')
-    plt.bar(x + width/2, class_df['Hierarchical Model F1'], width, label='Hierarchical Model')
-    
-    plt.xlabel('Class')
-    plt.ylabel('F1 Score')
-    plt.title('F1 Score Comparison Between Models by Class')
-    plt.xticks(x, class_names)
-    plt.legend()
-    plt.savefig(f'model_comparison_{target_label}.png')
-    plt.show()
+    if show_pic:
+        plt.bar(x - width/2, class_df['Standard Model F1'], width, label='Standard Model')
+        plt.bar(x + width/2, class_df['Hierarchical Model F1'], width, label='Hierarchical Model')
+        
+        plt.xlabel('Class')
+        plt.ylabel('F1 Score')
+        plt.title('F1 Score Comparison Between Models by Class')
+        plt.xticks(x, class_names)
+        plt.legend()
+        plt.savefig(f'model_comparison_{target_label}.png')
+        plt.show()
     # 在main函数中现有评估标准模型和分层模型的代码后添加：
 
     # Print GPU memory usage
@@ -898,4 +940,6 @@ def main():
         print(f"Cached Memory After Cleanup: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
 if __name__ == "__main__":
-    main()
+    for lab in target_labels:
+        target_label = lab
+        main()
