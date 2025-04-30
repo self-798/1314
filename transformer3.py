@@ -24,7 +24,7 @@ seq_length = 60
 
 train_model = False # 是否训练模型
 train_model_hierarchical =  False # 是否训练分层模型
-show_pic = False # 是否显示图片
+show_pic =True # 是否显示图片
 
 
 epochs = 20
@@ -650,9 +650,13 @@ def main():
     if os.path.exists(model_path) and not train_model:
         print(f"加载已有标准模型: {model_path}")
         standard_model.load_state_dict(torch.load(model_path, weights_only=True))
+    pict_dir = f'./pict/{target_label}'
+    if not os.path.exists(pict_dir):   
+        os.makedirs(pict_dir)
     if train_model:
         print("训练标准Transformer模型...")
         train_start = time.time()
+        
         
         # 训练标准模型
         optimizer = optim.AdamW(standard_model.parameters(), lr=base_lr, weight_decay=0.05)
@@ -752,7 +756,6 @@ def main():
         
         standard_train_time = time.time() - train_start
         print(f"标准模型训练完成，总耗时: {standard_train_time:.2f}秒")
-        pict_dir = './figures'
         if not os.path.exists(pict_dir):
             os.makedirs(pict_dir)
         if show_pic:
@@ -927,8 +930,8 @@ def main():
         plt.title('F1 Score Comparison Between Models by Class')
         plt.xticks(x, class_names)
         plt.legend()
-        plt.savefig(f'model_comparison_{target_label}.png')
-        plt.show()
+        plt.savefig([pict_dir, 'class_performance_comparison.png'])
+        # plt.show()
     # 在main函数中现有评估标准模型和分层模型的代码后添加：
 
     # Print GPU memory usage
