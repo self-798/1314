@@ -19,14 +19,14 @@ from tqdm import tqdm
 import time
 os.environ['TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL'] = '1'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-train_model = False # 是否训练模型
-train_model_hierarchical =  False  # 是否训练分层模型
+train_model = True # 是否训练模型
+train_model_hierarchical =  True # 是否训练分层模型
 epochs = 25
-target_label = 'label_20'
-seq_length = 20
+target_label = 'label_10'
+seq_length = 60
 patience = 7 # 早停耐心值
 class_weights = torch.tensor([2.5, 0.6, 2.6], device=device)
-batch_size = 1024 * 2 # 增大批量大小以提高GPU利用率
+batch_size = 1024 * 1 # 增大批量大小以提高GPU利用率
 base_lr = 0.001
 dropout = 0.2
 
@@ -34,7 +34,7 @@ base_path = r'./train_set/train_set'
 files = [
     f"snapshot_sym{j}_date{i}_{session}.csv"
     for j in range(0, 5)  # sym_0 到 sym_4
-    for i in range(0,51)  # date_0 到 date_100
+    for i in range(0,101)  # date_0 到 date_100
     for session in ['am', 'pm']
 ]
 
@@ -285,40 +285,76 @@ class HierarchicalTransformer:
         )
     
     def _prepare_stability_data(self, data_loader):
-        """准备稳定性模型的数据（二分类：稳定vs非稳定）"""
-        new_dataset = []
-        for batch_X, batch_y in data_loader:
-            # 转换标签：1保持为1（稳定），0和2变为0（不稳定）
-            new_y = torch.zeros_like(batch_y)
-            new_y[batch_y == 1] = 1  # 稳定类别
-            new_dataset.append((batch_X, new_y))
-        return new_dataset
+        """准备稳定性模型的数据（二分类：稳定vs非稳定）- 显存优化版"""
+        class StabilityDataset:
+            def __init__(self, data_loader):
+                self.data_loader = data_loader
+                self.length = len(data_loader)
+            
+            def __len__(self):
+                return self.length
+            
+            def __iter__(self):
+                for batch_X, batch_y in self.data_loader:
+                    # 转换标签：1保持为1（稳定），0和2变为0（不稳定）
+                    new_y = torch.zeros_like(batch_y)
+                    new_y[batch_y == 1] = 1  # 稳定类别
+                    yield batch_X, new_y
+                    # 手动触发垃圾回收
+                    del new_y
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+        
+        return StabilityDataset(data_loader)
     
     def _prepare_direction_data(self, data_loader):
-        """准备方向性模型的数据（二分类：上涨vs下跌，仅使用非稳定样本）"""
-        new_dataset = []
-        for batch_X, batch_y in data_loader:
-            # 筛选非稳定样本
-            mask = batch_y != 1
-            if mask.sum() > 0:  # 确保有非稳定样本
-                filtered_X = batch_X[mask]
-                filtered_y = batch_y[mask]
-                # 转换标签：0->0（下跌），2->1（上涨）
-                new_y = torch.zeros_like(filtered_y)
-                new_y[filtered_y == 2] = 1  # 上涨类别
-                new_dataset.append((filtered_X, new_y))
-        return new_dataset
+        """准备方向性模型的数据（二分类：上涨vs下跌，仅使用非稳定样本）- 显存优化版"""
+        class DirectionDataset:
+            def __init__(self, data_loader):
+                self.data_loader = data_loader
+                # 需要计算实际长度
+                self.length = 0
+                for _, batch_y in data_loader:
+                    mask = batch_y != 1
+                    if mask.sum() > 0:
+                        self.length += 1
+            
+            def __len__(self):
+                return self.length
+            
+            def __iter__(self):
+                for batch_X, batch_y in self.data_loader:
+                    # 筛选非稳定样本
+                    mask = batch_y != 1
+                    if mask.sum() > 0:  # 确保有非稳定样本
+                        filtered_X = batch_X[mask]
+                        filtered_y = batch_y[mask]
+                        
+                        # 转换标签：0->0（下跌），2->1（上涨）
+                        new_y = torch.zeros_like(filtered_y)
+                        new_y[filtered_y == 2] = 1  # 上涨类别
+                        
+                        yield filtered_X, new_y
+                        
+                        # 手动释放不需要的张量
+                        del filtered_X, filtered_y, new_y, mask
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+        
+        return DirectionDataset(data_loader)
     
     def _train_single_model(self, model, train_data, val_data, epochs, model_path):
-        """训练单个模型"""
+        """训练单个模型 - 显存优化版"""
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.05)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=True)
-        # Check if models already exist
+        
+        # 检查是否已有模型
+        existing_val_acc = 0
         if os.path.exists(model_path):
             print(f"Loading existing model from {model_path}")
             model.load_state_dict(torch.load(model_path))
-            # Check if model already performs well
+            # 检查现有模型性能
             model.eval()
             with torch.no_grad():
                 val_correct = 0
@@ -328,13 +364,20 @@ class HierarchicalTransformer:
                     _, predicted = torch.max(outputs, 1)
                     val_total += batch_y.size(0)
                     val_correct += (predicted == batch_y).sum().item()
+                    
+                    # 释放显存
+                    del outputs, predicted
+                    torch.cuda.empty_cache()
+                    
                 existing_val_acc = 100 * val_correct / val_total if val_total > 0 else 0
                 print(f"Existing model validation accuracy: {existing_val_acc:.2f}%")
-                if existing_val_acc > 80:  # If model already performs well
+                if existing_val_acc > 80:  # 如果模型已经表现良好
                     print(f"Existing model performs well, skipping training")
                     return
-        best_val_acc = existing_val_acc if os.path.exists(model_path) else 0 
+                    
+        best_val_acc = existing_val_acc
         no_improve = 0
+        patience = 5
         
         for epoch in range(epochs):
             # 训练阶段
@@ -343,21 +386,26 @@ class HierarchicalTransformer:
             correct = 0
             total = 0
             
+            # 使用生成器风格的数据集
             for batch_X, batch_y in train_data:
-                # 数据已经在GPU上，无需再次转移
-                
                 optimizer.zero_grad()
                 outputs = model(batch_X)
                 loss = criterion(outputs, batch_y)
                 loss.backward()
                 
+                # 梯度裁剪
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 
+                # 统计
                 total_loss += loss.item()
                 _, predicted = torch.max(outputs, 1)
                 total += batch_y.size(0)
                 correct += (predicted == batch_y).sum().item()
+                
+                # 释放显存
+                del outputs, loss, predicted
+                torch.cuda.empty_cache()
             
             train_loss = total_loss / len(train_data)
             train_acc = 100 * correct / total if total > 0 else 0
@@ -370,23 +418,28 @@ class HierarchicalTransformer:
             
             with torch.no_grad():
                 for batch_X, batch_y in val_data:
-                    # 数据已经在GPU上，无需再次转移
-                    
                     outputs = model(batch_X)
                     loss = criterion(outputs, batch_y)
                     val_loss += loss.item()
                     _, predicted = torch.max(outputs, 1)
                     total += batch_y.size(0)
                     correct += (predicted == batch_y).sum().item()
+                    
+                    # 释放显存
+                    del outputs, loss, predicted
+                    torch.cuda.empty_cache()
             
             val_loss = val_loss / len(val_data) if len(val_data) > 0 else float('inf')
             val_acc = 100 * correct / total if total > 0 else 0
             
+            # 更新学习率
             scheduler.step(val_acc)
             
+            # 打印结果
             print(f'Epoch {epoch+1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.2f}%, '
-                  f'Val Loss={val_loss:.4f}, Val Acc={val_acc:.2f}%')
+                f'Val Loss={val_loss:.4f}, Val Acc={val_acc:.2f}%')
             
+            # 保存最佳模型
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 torch.save(model.state_dict(), model_path)
