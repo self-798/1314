@@ -8,6 +8,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, roc_curve, auc , f1_score
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import OneCycleLR
@@ -640,7 +641,7 @@ with torch.no_grad():
         is_stable = probas[:, 1] > 0.4
         
         # 2. 对非稳定样本再判断上涨/下跌
-        non_stable = ~is_stable
+        non_stable = is_stable
         up_vs_down = probas[non_stable, 2] > probas[non_stable, 0]
         
         # 3. 组合最终预测

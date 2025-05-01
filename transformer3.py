@@ -20,18 +20,18 @@ import time
 os.environ['TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL'] = '1'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 target_labels = ['label_5', 'label_10', 'label_20', 'label_40', 'label_60']
-seq_length = 60
+seq_length = 100
 
-train_model = False # 是否训练模型
+train_model = True # 是否训练模型
 train_model_hierarchical =  False # 是否训练分层模型
 show_pic =True # 是否显示图片
 
 
 epochs = 20
 # target_labels = target_labels[0]  # 选择目标标签
-target_label =[ target_labels[0]]
+target_label =['label_5', 'label_10', 'label_20', 'label_40', 'label_60']
 patience = 5 # 早停耐心值
-class_weights = torch.tensor([2.5, 0.6, 2.6], device=device)
+class_weights = torch.tensor([3, 0.5, 3], device=device)
 batch_size = 1024 * 1 # 增大批量大小以提高GPU利用率
 base_lr = 0.0013
 dropout = 0.2
@@ -43,6 +43,15 @@ files = [
     for i in range(0,102)  # date_0 到 date_100
     for session in ['am', 'pm']
 ]
+
+
+# 模型参数
+d_model = 256  # 模型维度
+nhead = 8  # 多头注意力头数
+num_layers = 4  # Transformer编码器层数
+dim_feedforward = 512  # 前馈网络维度
+num_classes = 3  # 类别数：下跌、稳定、上涨
+
 
 # 设置支持中文的字体
 plt.rcParams['font.sans-serif'] = ['SimHei']
@@ -531,8 +540,8 @@ def preprocess_and_load_to_gpu(df, feature_cols, target_col, seq_length):
     # 时间序列分割：保持时间顺序性
     # 使用70%数据作为训练集, 15%作为验证集, 15%作为测试集
     n = len(df)
-    train_idx = int(n * 0.94)
-    val_idx = int(n * 0.97)
+    train_idx = int(n * 0.7)
+    val_idx = int(n * 0.85)
     
     # 标准化特征
     scaler = StandardScaler()
@@ -545,7 +554,7 @@ def preprocess_and_load_to_gpu(df, feature_cols, target_col, seq_length):
     #     # 仅使用非稳定样本进行训练
         
     print(f"训练集大小: {len(train_df)}, 验证集大小: {len(val_df)}, 测试集大小: {len(test_df)}")
-    
+    # Calculate and print the number of days in each split for monitoring purposes
     # 创建GPU优化的数据集
     print("加载训练集到GPU...")
     train_dataset = TimeSeriesSequenceDatasetGPU(train_df, feature_cols, target_col, seq_length, preload_gpu=True)
@@ -617,12 +626,6 @@ def main():
     data_prep_time = time.time() - start_time
     print(f"数据准备阶段总耗时: {data_prep_time:.2f}秒")
     
-    # 模型参数
-    d_model = 128  # 模型维度
-    nhead = 8  # 多头注意力头数
-    num_layers = 3  # Transformer编码器层数
-    dim_feedforward = 256  # 前馈网络维度
-    num_classes = 3  # 类别数：下跌、稳定、上涨
     
     # 初始化标准Transformer模型（用于对比）
     print("初始化标准Transformer模型...")
@@ -650,6 +653,8 @@ def main():
     if os.path.exists(model_path) and not train_model:
         print(f"加载已有标准模型: {model_path}")
         standard_model.load_state_dict(torch.load(model_path, weights_only=True))
+    else:
+        print("没有找到已有模型，开始训练新的模型...")
     pict_dir = f'./pict/{target_label}'
     if not os.path.exists(pict_dir):   
         os.makedirs(pict_dir)
@@ -930,7 +935,7 @@ def main():
         plt.title('F1 Score Comparison Between Models by Class')
         plt.xticks(x, class_names)
         plt.legend()
-        plt.savefig([pict_dir, 'class_performance_comparison.png'])
+        plt.savefig(f'{pict_dir}/training_history_{target_label}.png')
         # plt.show()
     # 在main函数中现有评估标准模型和分层模型的代码后添加：
 

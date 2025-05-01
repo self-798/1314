@@ -1,0 +1,2 @@
+     label_5 label_10 label_20 label_40 label_60
+seq  60        60         60        60        60
