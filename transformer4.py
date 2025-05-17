@@ -33,10 +33,10 @@ show_pic = True
 
 # 训练参数
 epochs = 30
-patience = 5  # 早停耐心值
-class_weights = torch.tensor([2.5, 0.6, 2.6], device=device)
+patience = 10  # 早停耐心值
+class_weights = torch.tensor([2.5, 0.38, 2.6], device=device)
 batch_size = 1024 * 2  # 批量大小
-base_lr = 0.00045
+base_lr = 0.0001
 dropout = 0.3
 
 # 数据路径
@@ -44,7 +44,7 @@ base_path = r'./train_set/train_set'
 files = [
     f"snapshot_sym{j}_date{i}_{session}.csv"
     for j in range(0, 5)  # sym_0 到 sym_4
-    for i in range(0, 102)  # date_0 到 date_100
+    for i in range(0, 10)  # date_0 到 date_100
     for session in ['am', 'pm']
 ]
 
@@ -193,7 +193,26 @@ class TimeSeriesPositionalEncoding(nn.Module):
         x = self.time_aware_proj(x)
         
         return self.dropout(x)
-
+    
+class FeatureWiseStandardization(nn.Module):
+    """
+    对每个样本的每个特征单独标准化（保留时间维度变化）
+    """
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        
+    def forward(self, x):
+        # x: [batch_size, seq_len, features]
+        
+        # 计算每个样本每个特征通道的均值和标准差
+        # 只沿着seq_len维度计算
+        mean = torch.mean(x, dim=1, keepdim=True)  # [batch_size, 1, features]
+        std = torch.std(x, dim=1, keepdim=True) + self.eps
+        
+        # 标准化样本，保留时间序列内的变化模式
+        return (x - mean) / std
+    
 # 多标签预测Transformer模型
 class MultiLabelTransformerModel(nn.Module):
     def __init__(self, input_dim, d_model, nhead, num_layers, dim_feedforward, dropout=0.2):
@@ -203,9 +222,14 @@ class MultiLabelTransformerModel(nn.Module):
         self.target_labels = target_labels
         self.num_classes = 3  # 假设所有标签都是3分类(下跌、稳定、上涨)
         
+        self.sample_norm = FeatureWiseStandardization()  # 特征级标准化(推荐)
+
         # 特征维度映射到模型维度
         self.input_proj = nn.Linear(input_dim, d_model)
-        
+
+         # 添加另一个LayerNorm用于稳定特征分布
+        self.input_norm = nn.LayerNorm(d_model)
+
         # 使用改进的时间序列位置编码
         self.pos_encoder = TimeSeriesPositionalEncoding(d_model, dropout)
         
@@ -228,12 +252,22 @@ class MultiLabelTransformerModel(nn.Module):
         
         # 为每个标签创建单独的分类头
         self.classifiers = nn.ModuleDict()
-        for label in self.target_labels:
-            self.classifiers[label] = nn.Linear(dim_feedforward, self.num_classes)
-        
-        # 初始化权重
-        self._init_weights()
-    
+        for i, label in enumerate(self.target_labels):
+            # 根据预测窗口长度调整网络复杂度
+            window_size = int(label.split('_')[1])
+            hidden_size = min(dim_feedforward, int(dim_feedforward * (0.5 + window_size/60)))
+            
+            self.classifiers[label] = nn.Sequential(
+                nn.Linear(dim_feedforward, hidden_size),
+                nn.LayerNorm(hidden_size),
+                nn.GELU(),
+                nn.Dropout(dropout * (0.8 + 0.4 * i/len(self.target_labels))),  # 远期预测需要更多正则化
+                nn.Linear(hidden_size, hidden_size//2),
+                nn.GELU(),
+                nn.Dropout(dropout * 0.8),
+                nn.Linear(hidden_size//2, self.num_classes)
+            )
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -243,10 +277,15 @@ class MultiLabelTransformerModel(nn.Module):
     
     def forward(self, x, target_label=None):
         # x shape: [batch_size, seq_len, input_dim]
-        
+        # 1. 应用样本级标准化 - 在投影前
+        x = self.sample_norm(x)
+
         # 投影到d_model维度
         x = self.input_proj(x)
-        
+
+         # 3. 应用LayerNorm稳定特征分布
+        x = self.input_norm(x)
+
         # 添加位置编码
         x = self.pos_encoder(x)
         
@@ -594,8 +633,8 @@ def preprocess_and_load_to_gpu_multi_label(df, feature_cols, target_labels, seq_
     val_idx = int(n * 0.85)
     
     # 标准化特征
-    scaler = StandardScaler()
-    df[feature_cols] = scaler.fit_transform(df[feature_cols])
+    # scaler = StandardScaler()
+    # df[feature_cols] = scaler.fit_transform(df[feature_cols])
     
     train_df = df.iloc[:train_idx]
     val_df = df.iloc[train_idx:val_idx]
@@ -717,7 +756,7 @@ def main():
         multi_model_path = './models/multi_label_transformer_model.pth'
         
         # 检查是否已有模型
-        if os.path.exists(multi_model_path) and not train_model:
+        if os.path.exists(multi_model_path) and train_model:
             print(f"加载已有多标签模型: {multi_model_path}")
             multi_model.load_state_dict(torch.load(multi_model_path))
         
