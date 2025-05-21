@@ -17,20 +17,21 @@ import math
 from numpy.lib.stride_tricks import sliding_window_view
 from tqdm import tqdm
 import time
+import json
+
 os.environ['TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL'] = '1'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 target_labels = ['label_5', 'label_10', 'label_20', 'label_40', 'label_60']
 seq_length = 100
 
-train_model = True # 是否训练模型
+train_model = False# 是否训练模型
 train_model_hierarchical =  False # 是否训练分层模型
 show_pic =True # 是否显示图片
 
-target_labels = target_labels[0:1]
-epochs = 20
+target_labels = target_labels[:]
+epochs = 50
 target_label =['label_5', 'label_10', 'label_20', 'label_40', 'label_60']
-patience = 10 # 早停耐心值
-class_weights = torch.tensor([3, 1.7, 3], dtype=torch.float32 , device=device)
+patience = 7 # 早停耐心值
 batch_size = 1024 * 1 # 增大批量大小以提高GPU利用率
 base_lr = 0.0013
 dropout = 0.2
@@ -106,22 +107,7 @@ class TimeSeriesSequenceDatasetGPU(Dataset):
         
         # 直接从预加载的张量中切片
         features = self.features[start_idx:actual_idx]
-        target = self.target[actual_idx - 1]  # 最后一个时间步的标签
-        
-        if self.normalize_seq:
-            # 向量化标准化 - 一次性计算所有特征的统计量
-            mean = torch.mean(features, dim=0, keepdim=True)  # [1, feature_dim]
-            std = torch.std(features, dim=0, keepdim=True)    # [1, feature_dim]
-            
-            # 创建掩码，标记标准差足够大的特征
-            mask = (std > 1e-6).float()
-            
-            # 安全除法：将过小的标准差设为1，避免除零错误
-            std = torch.clamp(std, min=1e-6)
-            
-            # 应用标准化，只对有效特征生效
-            features = (features - mean) * mask / std
-    
+        target = self.target[actual_idx - 1]  
         return features.float(), target.long()
     
 
@@ -285,287 +271,6 @@ class TransformerModel(nn.Module):
         x = self.classifier(x)
         return x
 
-# 分层Transformer实现
-class HierarchicalTransformer:
-    def __init__(self, input_dim, d_model, nhead, num_layers, dim_feedforward, dropout=0.1):
-        """初始化分层Transformer模型"""
-        # 第一层模型：判断是否稳定
-        self.stability_model = TransformerModel(
-            input_dim, d_model, nhead, num_layers, dim_feedforward, 2, dropout).to(device)
-        
-        # 第二层模型：判断上涨或下跌
-        self.direction_model = TransformerModel(
-            input_dim, d_model, nhead, num_layers, dim_feedforward, 2, dropout).to(device)
-        
-        # 模型路径
-        self.stability_model_path = f'./models/stability_model_{target_label}.pth'
-        self.direction_model_path = f'./models/direction_model_{target_label}.pth'
-        
-        # 尝试加载已有模型
-        self.load_models()
-    
-    def load_models(self):
-        """加载预训练模型（如果存在）"""
-        if os.path.exists(self.stability_model_path):
-            print(f"加载稳定性模型: {self.stability_model_path}")
-            self.stability_model.load_state_dict(torch.load(self.stability_model_path))
-        
-        if os.path.exists(self.direction_model_path):
-            print(f"加载方向性模型: {self.direction_model_path}")
-            self.direction_model.load_state_dict(torch.load(self.direction_model_path))
-    
-    def save_models(self):
-        """保存当前模型"""
-        torch.save(self.stability_model.state_dict(), self.stability_model_path)
-        torch.save(self.direction_model.state_dict(), self.direction_model_path)
-    
-    def train(self, train_loader, val_loader, epochs=20):
-        """训练分层模型"""
-        # 准备第一层模型数据：转换标签(1->1, 0或2->0)
-        stability_train_data = self._prepare_stability_data(train_loader)
-        stability_val_data = self._prepare_stability_data(val_loader)
-        
-        # 准备第二层模型数据：仅保留非稳定样本(0->0, 2->1)
-        direction_train_data = self._prepare_direction_data(train_loader)
-        direction_val_data = self._prepare_direction_data(val_loader)
-        
-        # 训练第一层模型（稳定性判断）
-        print("\n开始训练稳定性模型...")
-        self._train_single_model(
-            self.stability_model, 
-            stability_train_data, 
-            stability_val_data, 
-            epochs, 
-            self.stability_model_path
-        )
-        
-        # 训练第二层模型（方向判断）
-        print("\n开始训练方向性模型...")
-        self._train_single_model(
-            self.direction_model, 
-            direction_train_data, 
-            direction_val_data, 
-            epochs, 
-            self.direction_model_path
-        )
-    
-    def _prepare_stability_data(self, data_loader):
-        """准备稳定性模型的数据（二分类：稳定vs非稳定）- 显存优化版"""
-        class StabilityDataset:
-            def __init__(self, data_loader):
-                self.data_loader = data_loader
-                self.length = len(data_loader)
-            
-            def __len__(self):
-                return self.length
-            
-            def __iter__(self):
-                for batch_X, batch_y in self.data_loader:
-                    # 转换标签：1保持为1（稳定），0和2变为0（不稳定）
-                    new_y = torch.zeros_like(batch_y)
-                    new_y[batch_y == 1] = 1  # 稳定类别
-                    yield batch_X, new_y
-                    # 手动触发垃圾回收
-                    del new_y
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-        
-        return StabilityDataset(data_loader)
-    
-    def _prepare_direction_data(self, data_loader):
-        """准备方向性模型的数据（二分类：上涨vs下跌，仅使用非稳定样本）- 显存优化版"""
-        class DirectionDataset:
-            def __init__(self, data_loader):
-                self.data_loader = data_loader
-                # 需要计算实际长度
-                self.length = 0
-                for _, batch_y in data_loader:
-                    mask = batch_y != 1
-                    if mask.sum() > 0:
-                        self.length += 1
-            
-            def __len__(self):
-                return self.length
-            
-            def __iter__(self):
-                for batch_X, batch_y in self.data_loader:
-                    # 筛选非稳定样本
-                    mask = batch_y != 1
-                    if mask.sum() > 0:  # 确保有非稳定样本
-                        filtered_X = batch_X[mask]
-                        filtered_y = batch_y[mask]
-                        
-                        # 转换标签：0->0（下跌），2->1（上涨）
-                        new_y = torch.zeros_like(filtered_y)
-                        new_y[filtered_y == 2] = 1  # 上涨类别
-                        
-                        yield filtered_X, new_y
-                        
-                        # 手动释放不需要的张量
-                        del filtered_X, filtered_y, new_y, mask
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-        
-        return DirectionDataset(data_loader)
-    
-    def _train_single_model(self, model, train_data, val_data, epochs, model_path):
-        """训练单个模型 - 显存优化版"""
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.05)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=True)
-        
-        # 检查是否已有模型
-        existing_val_acc = 0
-        if os.path.exists(model_path):
-            print(f"Loading existing model from {model_path}")
-            model.load_state_dict(torch.load(model_path))
-            # 检查现有模型性能
-            model.eval()
-            with torch.no_grad():
-                val_correct = 0
-                val_total = 0
-                for batch_X, batch_y in val_data:
-                    outputs = model(batch_X)
-                    _, predicted = torch.max(outputs, 1)
-                    val_total += batch_y.size(0)
-                    val_correct += (predicted == batch_y).sum().item()
-                    
-                    # 释放显存
-                    del outputs, predicted
-                    torch.cuda.empty_cache()
-                    
-                existing_val_acc = 100 * val_correct / val_total if val_total > 0 else 0
-                print(f"Existing model validation accuracy: {existing_val_acc:.2f}%")
-                if existing_val_acc > 80:  # 如果模型已经表现良好
-                    print(f"Existing model performs well, skipping training")
-                    return
-                    
-        best_val_acc = existing_val_acc
-        no_improve = 0
-        patience = 5
-        
-        for epoch in range(epochs):
-            # 训练阶段
-            model.train()
-            total_loss = 0
-            correct = 0
-            total = 0
-            
-            # 使用生成器风格的数据集
-            for batch_X, batch_y in train_data:
-                optimizer.zero_grad()
-                outputs = model(batch_X)
-                loss = criterion(outputs, batch_y)
-                loss.backward()
-                
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                
-                # 统计
-                total_loss += loss.item()
-                _, predicted = torch.max(outputs, 1)
-                total += batch_y.size(0)
-                correct += (predicted == batch_y).sum().item()
-                
-                # 释放显存
-                del outputs, loss, predicted
-                torch.cuda.empty_cache()
-            
-            train_loss = total_loss / len(train_data)
-            train_acc = 100 * correct / total if total > 0 else 0
-            
-            # 验证阶段
-            model.eval()
-            val_loss = 0
-            correct = 0
-            total = 0
-            
-            with torch.no_grad():
-                for batch_X, batch_y in val_data:
-                    outputs = model(batch_X)
-                    loss = criterion(outputs, batch_y)
-                    val_loss += loss.item()
-                    _, predicted = torch.max(outputs, 1)
-                    total += batch_y.size(0)
-                    correct += (predicted == batch_y).sum().item()
-                    
-                    # 释放显存
-                    del outputs, loss, predicted
-                    torch.cuda.empty_cache()
-            
-            val_loss = val_loss / len(val_data) if len(val_data) > 0 else float('inf')
-            val_acc = 100 * correct / total if total > 0 else 0
-            
-            # 更新学习率
-            scheduler.step(val_acc)
-            
-            # 打印结果
-            print(f'Epoch {epoch+1}: Train Loss={train_loss:.4f}, Train Acc={train_acc:.2f}%, '
-                f'Val Loss={val_loss:.4f}, Val Acc={val_acc:.2f}%')
-            
-            # 保存最佳模型
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                torch.save(model.state_dict(), model_path)
-                print(f"模型已保存: {model_path}")
-                no_improve = 0
-            else:
-                no_improve += 1
-                
-            # 早停
-            if no_improve >= patience:
-                print(f"早停: {patience} 轮无改善")
-                break
-    
-    def predict(self, X):
-        """使用分层模型进行预测"""
-        self.stability_model.eval()
-        self.direction_model.eval()
-        with torch.no_grad():
-            # 第一步：预测是否稳定
-            stability_output = self.stability_model(X)
-            stability_pred = torch.argmax(stability_output, dim=1)
-            
-            # 初始化最终预测结果
-            final_pred = torch.ones_like(stability_pred)  # 默认值为1（稳定）
-            
-            # 第二步：对于不稳定样本，预测上涨或下跌
-            unstable_mask = (stability_pred == 0)
-            if torch.any(unstable_mask):
-                unstable_X = X[unstable_mask]
-                direction_output = self.direction_model(unstable_X)
-                direction_pred = torch.argmax(direction_output, dim=1)
-                
-                # 合并结果：0=下跌，2=上涨
-                final_pred[unstable_mask] = torch.where(direction_pred == 1, 
-                                                    torch.tensor(2, device=device), 
-                                                    torch.tensor(0, device=device))
-            
-            return final_pred
-
-# 评估分层模型函数
-def evaluate_hierarchical_model(hierarchical_model, data_loader, device):
-    """评估分层模型性能"""
-    hierarchical_model.stability_model.eval()
-    hierarchical_model.direction_model.eval()
-    
-    all_preds = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for batch_X, batch_y in data_loader:
-            # 数据已经在GPU上，无需再次转移
-            predictions = hierarchical_model.predict(batch_X)
-            all_preds.extend(predictions.cpu().numpy())
-            all_labels.extend(batch_y.cpu().numpy())
-    
-    # 计算评估指标
-    accuracy = accuracy_score(all_labels, all_preds)
-    report = classification_report(all_labels, all_preds, digits=4)
-    conf_matrix = confusion_matrix(all_labels, all_preds)
-    
-    return accuracy, report, conf_matrix, all_preds, all_labels
 
 # 预处理数据并将其预加载到GPU
 def preprocess_and_load_to_gpu(df, feature_cols, target_col, seq_length):
@@ -614,7 +319,19 @@ def preprocess_and_load_to_gpu(df, feature_cols, target_col, seq_length):
 
     # 先用训练集的数据拟合scaler
     scaler.fit(train_features)
-    # 然后用训练集的均值和标准差统计量来转换所有数据
+    # 保存标准化器的均值和标准差
+    scaler_params_path = './scaler_params.json'
+    scaler_params = {
+        'mean': scaler.mean_.tolist(),
+        # 换行以提高可读性
+        'scale': scaler.scale_.tolist(),
+        'columns': feature_cols  # 保存列名
+    }
+    with open(scaler_params_path, 'w') as f:
+        json.dump(scaler_params, f, indent=4)  # 使用缩进格式化JSON
+    print(f"标准化器参数和列名已保存到 {scaler_params_path}")
+    scaler.save_params = scaler.mean_, scaler.scale_
+    
     df[feature_cols] = scaler.transform(df[feature_cols])
     
     test_df = df.iloc[val_idx:]
@@ -646,33 +363,6 @@ def preprocess_and_load_to_gpu(df, feature_cols, target_col, seq_length):
     
     return train_loader, val_loader, test_loader, len(feature_cols) , class_weights
 
-def ensemble_predict(X, standard_model, hierarchical_model, stable_threshold=0.75):
-    # 获取标准模型预测和置信度
-    standard_output = standard_model(X)
-    standard_probs = F.softmax(standard_output, dim=1)
-    standard_pred = torch.argmax(standard_probs, dim=1)
-    
-    # 获取分层模型预测
-    hierarchical_pred = hierarchical_model.predict(X)
-    
-    # 创建集成预测
-    ensemble_pred = standard_pred.clone()
-    
-    # 当标准模型对稳定类预测置信度不高时，采用分层模型预测
-    uncertain_mask = (standard_probs[:, 1] < stable_threshold) | (standard_pred != 1)
-    ensemble_pred[uncertain_mask] = hierarchical_pred[uncertain_mask]
-    
-    return ensemble_pred
-
-def compute_balanced_weights(dataset):
-    labels = torch.tensor([y.item() for _, y in dataset])
-    class_counts = torch.bincount(labels)
-    total = class_counts.sum()
-    # 计算反比权重并缩放
-    weights = total / (class_counts * len(class_counts))
-    # 归一化到平均值为1
-    weights = weights / weights.mean()
-    return weights.to(device)
 
 def main():
     # 1. 加载数据 - 保持原有代码
@@ -698,7 +388,7 @@ def main():
     # 提取特征列（除标签和日期外）
     print("提取特征列...")
     feature_cols = [col for col in df.columns if col not in ['date','time','label_5', 'label_10', 'label_20', 'label_40', 'label_60']]
-    
+    print(f"特征列: {feature_cols}")
     # 使用优化的数据加载函数
     print(f"开始数据预处理和GPU加载，使用目标标签: {target_label}")
     train_loader, val_loader, test_loader, input_dim , class_weights = preprocess_and_load_to_gpu(df, feature_cols, target_label, seq_length)
@@ -719,16 +409,6 @@ def main():
         dropout=dropout
     ).to(device)
     
-    # 初始化分层Transformer模型
-    # print("初始化分层Transformer模型...")
-    # hierarchical_model = HierarchicalTransformer(
-    #     input_dim=input_dim,
-    #     d_model=d_model,
-    #     nhead=nhead,
-    #     num_layers=num_layers,
-    #     dim_feedforward=dim_feedforward,
-    #     dropout=dropout
-    # )
     model_path = f'./models/standard_model_{target_label}.pth'
     if os.path.exists(model_path):
         print(f"加载已有标准模型: {model_path}")
@@ -749,7 +429,6 @@ def main():
         optimizer = optim.AdamW(standard_model.parameters(), lr=base_lr, weight_decay=0.05)
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1 , weight=class_weights)
         # 使用ReduceLROnPlateau调度器
-         # ReduceLROnPlateau调度器
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, 
             mode='max',           # 基于验证准确率最大化
@@ -868,15 +547,6 @@ def main():
 
             plt.tight_layout()
             plt.savefig(f'{pict_dir}/loss_accuracy_curves_{target_label}.png')
-            # plt.show()
-
-    # 训练分层模型
-    if train_model_hierarchical:
-        print("\n训练分层Transformer模型...")
-        hierarchical_train_start = time.time()
-        hierarchical_model.train(train_loader, val_loader, epochs)
-        hierarchical_train_time = time.time() - hierarchical_train_start
-        print(f"分层模型训练完成，总耗时: {hierarchical_train_time:.2f}秒")
 
         
         
@@ -918,62 +588,7 @@ def main():
         plt.xlabel('Predicted Label')
         plt.savefig(f'{pict_dir}/standard_confusion_matrix_{target_label}.png')
         # plt.show()
-    """
 
-    要使用的模型
-    
-    """
-    # # Evaluate hierarchical model
-    # print("\nEvaluating Hierarchical Transformer Model...")
-    # hier_eval_start = time.time()
-    # hier_accuracy, hier_report, hier_conf_matrix, hier_all_preds, hier_all_labels = evaluate_hierarchical_model(
-    # hierarchical_model, test_loader, device
-    # )
-    # hier_eval_time = time.time() - hier_eval_start
-    # print(f"Hierarchical model evaluation completed, time: {hier_eval_time:.2f} seconds")
-    
-    # print("\nHierarchical Transformer Model Evaluation:")
-    # print(f"Test Accuracy: {hier_accuracy:.4f}")
-    # print("\nClassification Report:")
-    # print(hier_report)
-    # if show_pic:
-    # # Plot hierarchical model confusion matrix
-    #     plt.figure(figsize=(8, 6))
-    #     sns.heatmap(hier_conf_matrix, annot=True, fmt='d', cmap='Blues')
-    #     plt.title(f'Hierarchical Transformer Model Confusion Matrix - {target_label}')
-    #     plt.ylabel('True Label')
-    #     plt.xlabel('Predicted Label')
-    #     plt.savefig(f'{pict_dir}/training_history_{target_label}.png')
-    #     # plt.show()
-    
-    # # Compare model performance
-    # print("\nModel Performance Comparison:")
-    # print(f"Standard Transformer Accuracy: {std_accuracy:.4f}")
-    # print(f"Hierarchical Transformer Accuracy: {hier_accuracy:.4f}")
-    # print(f"Performance Improvement: {(hier_accuracy - std_accuracy) * 100:.2f}%")
-    
-    # # Generate performance comparison for each class
-    # class_names = ['Down', 'Stable', 'Up']
-    # std_class_report = classification_report(std_all_labels, std_all_preds, output_dict=True)
-    # hier_class_report = classification_report(hier_all_labels, hier_all_preds, output_dict=True)
-    
-    # Create class performance comparison table
-    # class_comparison = []
-    # for i, class_name in enumerate(class_names):
-    #     std_f1 = std_class_report[str(i)]['f1-score']
-    #     hier_f1 = hier_class_report[str(i)]['f1-score']
-    #     improvement = (hier_f1 - std_f1) * 100
-    #     class_comparison.append({
-    #         'Class': class_name,
-    #         'Standard Model F1': std_f1,
-    #         'Hierarchical Model F1': hier_f1,
-    #         'Improvement (%)': improvement
-    #     })
-    
-    # class_df = pd.DataFrame(class_comparison)
-    # print("\nClass Performance Comparison:")
-    # print(class_df)
-    # Create a DataFrame with results from standard and hierarchical models
     calls_df = pd.DataFrame({
         'True_Label': std_all_labels,
         'Standard_Pred': std_all_preds
@@ -996,31 +611,9 @@ def main():
         f.write("\n\nConfusion Matrix:\n")
         f.write(str(std_conf_matrix))
 
-    # # Save hierarchical model results
-    # with open(f'{results_dir}/hierarchical_model_results.txt_{target_label}', 'w') as f:
-    #     f.write(f"Accuracy: {hier_accuracy:.4f}\n\n")
-    #     f.write("Classification Report:\n")
-    #     f.write(str(hier_report))
-    #     f.write("\n\nConfusion Matrix:\n")
-    #     f.write(str(hier_conf_matrix))
 
     print(f"\nResults saved to {results_dir}")
-    # # Plot class performance comparison
-    # plt.figure(figsize=(10, 6))
-    # x = np.arange(len(class_names))
-    # width = 0.35
-    # if show_pic:
-    #     plt.bar(x - width/2, class_df['Standard Model F1'], width, label='Standard Model')
-    #     plt.bar(x + width/2, class_df['Hierarchical Model F1'], width, label='Hierarchical Model')
-        
-    #     plt.xlabel('Class')
-    #     plt.ylabel('F1 Score')
-    #     plt.title('F1 Score Comparison Between Models by Class')
-    #     plt.xticks(x, class_names)
-    #     plt.legend()
-    #     plt.savefig(f'{pict_dir}/training_history_{target_label}.png')
-        # plt.show()
-    # 在main函数中现有评估标准模型和分层模型的代码后添加：
+
 
     # Print GPU memory usage
     if torch.cuda.is_available():
