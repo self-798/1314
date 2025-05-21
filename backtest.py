@@ -371,21 +371,28 @@ def main():
     
 
     # # 合并所有文件
-    # df_list = []
-    # for file in files:
-    #     file_path = os.path.join(base_path, file)
-    #     if os.path.exists(file_path):
-    #         temp_df = pd.read_csv(file_path)
-    #         df_list.append(temp_df)
-    #         # print(f"加载文件: {file_path}，数据形状: {temp_df.shape}")
-    #     else:
-    #         print(f"文件 {file} 不存在，跳过。")
+    try:
+        # 尝试使用pickle文件
+        if os.path.exists('data_return_rates.pkl'):
+            df = pd.read_pickle('data_return_rates.pkl')
+            print(f"数据从pickle文件加载完成，数据形状: {df.shape}")
+        else:
+            raise FileNotFoundError("pickle文件不存在，将使用原始CSV文件")
+    except:
+        print("pickle文件不存在或损坏，从原始CSV文件加载数据...")
+        df_list = []
+        for file in tqdm(files, desc="加载CSV文件"):
+            file_path = os.path.join(base_path, file)
+            if os.path.exists(file_path):
+                temp_df = pd.read_csv(file_path)
+                df_list.append(temp_df)
+            else:
+                print(f"文件 {file} 不存在，跳过。")
 
-    # # 合并数据集
-    # print("合并所有数据文件...")
-    # df = pd.concat(df_list, ignore_index=True)
-    df = pd.read_pickle('data_return_rates.pkl')
-    print(f"数据加载完成，数据形状: {df.shape}")
+        # 合并数据集
+        print("合并所有数据文件...")
+        df = pd.concat(df_list, ignore_index=True)
+        print(f"从CSV文件加载完成，数据形状: {df.shape}")
     # 提取特征列（除标签和日期外）
     print("提取特征列...")
     # Define columns to exclude: metadata, labels, and returns
